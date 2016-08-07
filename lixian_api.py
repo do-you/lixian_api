@@ -1,22 +1,18 @@
 import json
 import requests
 import time
-from hashlib import md5
 from random import random
 import logging
-from functools import partial
 
 
+# refer:引用自binux
 def _now():
     return int(time.time() * 1000)
 
 
+# refer:引用自binux
 def _random():
     return str(_now()) + str(random() * (2000000 - 10) + 10)
-
-
-def _hex_md5(s):
-    return md5(s.encode('utf-8')).hexdigest()
 
 
 def _strip_sig(content):
@@ -49,21 +45,22 @@ def _js_args_parse(parm, content):
 
 
 def _js_json_parse(content):
-    return _strip_sig(content)
+    return json.loads(_strip_sig(content))
 
 
-class api_exception(Exception): pass
+class api_exception(Exception):
+    pass
 
 
 class thunder_lixian:
     def __init__(self):
         self.session = requests.Session()
         self.session.headers['User-Agent'] = r'Mozilla/5.0 (X11; Linux x86_64; rv:48.0) Gecko/20100101 Firefox/48.0'
-        self.is_login = False
+        self._is_login = False
         self.gdriveid = None
 
     def login(self, username, password, verify_key=None, verify_type='SEA', verifycode=None):
-        if self.is_login:
+        if self._is_login:
             raise api_exception('已经登陆,不能再登陆')
 
         check_res = self._check_user(username)
@@ -71,8 +68,6 @@ class thunder_lixian:
             login_res = self._post_login(username, password, check_res)
             if login_res:
                 raise api_exception(login_res)
-            else:
-                self.is_login = True
         else:
             if verify_key and verify_type and verifycode:
                 self.session.cookies['VERIFY_KEY'] = verify_key
@@ -82,10 +77,13 @@ class thunder_lixian:
                 self.session.cookies['verify_type'] = None
                 if login_res:
                     raise api_exception(login_res)
-                else:
-                    self.is_login = True
             else:
                 raise api_exception('需要验证码')
+        # 获取gdriveid
+        self._showtask_unfresh()
+        self._is_login = True
+        # 修改列表条目
+        self.session.cookies['pagenum'] = '100'
 
     _check_url = 'http://login.xunlei.com/check?u={username}&cachetime={time}'
 
@@ -126,7 +124,7 @@ class thunder_lixian:
             return None
 
     def get_lixian_url(self, url, verify_key=None, verify_type='SEA', verifycode=None):
-        if not self.is_login:
+        if not self._is_login:
             raise api_exception('请先登陆')
         # 获取链接的基本信息
         if url.startswith('magnet:'):
@@ -156,18 +154,16 @@ class thunder_lixian:
 
         # 获取url
         if url.startswith('magnet:'):
-            url_list = self._fill_bt_list(task_id, url_info)
-            # fixme:进度
-            return [(lixian_url, self.gdriveid) for lixian_url in url_list]
+            lixian_url = self._fill_bt_list(task_id, url_info)
         else:
-            task_data = self._showtask_unfresh(task_id)
-            if task_data['progress'] != 100:
-                raise api_exception('任务还未离线完成')
-            return task_data['lixian_url'], self.gdriveid
+            lixian_url = [self._task_process(task_id)]
+
+        if lixian_url is None:
+            raise api_exception('任务还未离线完成')
+        return lixian_url
 
     _task_check_url = 'http://dynamic.cloud.vip.xunlei.com/interface/task_check'
 
-    # fixme:返回结果的分析
     def _task_check(self, url):
         r = self.session.get(self._task_check_url, params={
             'callback': 'queryCid',
@@ -183,7 +179,6 @@ class thunder_lixian:
 
     _url_query_url = 'http://dynamic.cloud.vip.xunlei.com/interface/url_query'
 
-    # fixme:返回结果的分析
     def _url_query(self, url):
         r = self.session.get(self._url_query_url, params={
             'callback': 'queryUrl',
@@ -195,7 +190,11 @@ class thunder_lixian:
         r.raise_for_status()
         parms = ['flag', 'infohash', 'fsize', 'bt_title', 'is_full', 'subtitle', 'subformatsize', 'size_list',
                  'valid_list', 'file_icon', 'findex', 'is_blocked', 'random', 'rtcode']
-        return _js_args_parse(parms, r.content.decode('utf-8'))
+        res = _js_args_parse(parms, r.text)
+        if res['flag'] == '0':
+            return None
+        else:
+            return res
 
     _task_commit_url = 'http://dynamic.cloud.vip.xunlei.com/interface/task_commit'
 
@@ -227,28 +226,95 @@ class thunder_lixian:
             return None
         return args['taskid']
 
+    _task_process_url = 'http://dynamic.cloud.vip.xunlei.com/interface/task_process?callback=jsonp1470562464775&t=Sun%20Aug%2007%202016%2017:43:26%20GMT+0800%20(CST)'
+
+    def _task_process(self, tid):
+        r = self.session.post(self._task_process_url, data={
+            'list': tid,  # 可以批量
+            'nm_list': tid,  # 可以批量
+            'bt_list': '',
+            'uid': self.session.cookies['userid'],
+            'interfrom': 'task'
+        })
+        r.raise_for_status()
+        json_res = _js_json_parse(r.text)
+        lixian_url = json_res['Process']['Record'][0]['lixian_url']
+        if lixian_url == '':
+            return None
+        return lixian_url
+
+    _bt_task_commit_url = 'http://dynamic.cloud.vip.xunlei.com/interface/bt_task_commit?callback=jsonp1470230995939&t=Wed%20Aug%2003%202016%2022:10:20%20GMT+0800'
+
     def _bt_task_commit(self, info, verifycode):
-        pass
+        r = self.session.post(self._bt_task_commit_url, data={
+            'uid': self.session.cookies['userid'],
+            'btname': info['bt_title'],
+            'cid': info['infohash'],
+            'goldbean': 0,
+            'silverbean': 0,
+            'tsize': info['fsize'],
+            'findex': '_'.join(info['findex']) + '_',
+            'size': '_'.join(info['size_list']) + '_',
+            'o_taskid': 0,
+            'o_page': 'task',
+            'class_id': 0,
+            'interfrom': 'task',
+            'verify_code': verifycode
+        })
+        r.raise_for_status()
+        res_json = _js_json_parse(r.text)
+        if res_json['progress'] != 1:
+            return None
+        return res_json['id']
 
     _showtask_unfresh_url = 'http://dynamic.cloud.vip.xunlei.com/interface/showtask_unfresh'
 
-    def _showtask_unfresh(self, task_id):
+    def _showtask_unfresh(self):
         r = self.session.get(self._showtask_unfresh_url, params={
             'callback': 'jsonp1470122229847',
             't': 'Fri%20Jul%2029%202016%2011:38:04%20GMT+0800',
             'type_id': 4,
             'page': 1,
-            'tasknum': 1,
+            'tasknum': 30,
             'p': 1,
             'interfrom': 'task'
         })
         r.raise_for_status()
         json_res = _js_json_parse(r.content.decode('utf-8'))
-        if self.gdriveid is None:
-            self.gdriveid = 'gdriveid=' + json_res['info']['user']['cookie']
-        return json_res['info']['tasks'][0]
+        self.gdriveid = 'gdriveid=' + json_res['info']['user']['cookie']
+
+    _fill_bt_list_url = 'http://dynamic.cloud.vip.xunlei.com/interface/fill_bt_list'
 
     # 返回[urls]
     def _fill_bt_list(self, tid, info):
-        pass
+        item_num = len(info['findex'])
+        results = []
+        has_url = False
+        now_page = 1
+        while item_num > 0:
+            r = self.session.get(self._fill_bt_list_url, params={
+                'callback': 'fill_bt_list',
+                'tid': tid,
+                'infoid': info['infohash'],
+                'g_net': 1,
+                'p': now_page,
+                'uid': self.session.cookies['userid'],
+                'interfrom': 'task',
+                'noCacheIE': _now()
+            })
+            r.raise_for_status()
+            json_res = _js_json_parse(r.text)
+            records = json_res['Result']['Record']
+            for rec in records:
+                results.append(rec['downurl'])
+                if results[-1] != '':
+                    has_url = True
+
+            item_num -= json_res['Result']['btpernum']
+            now_page += 1
+
+        if has_url:
+            return results
+        else:
+            return None
 
